@@ -1,0 +1,501 @@
+/*
+ * VMCBox
+ * -----------------
+ * Arduino UNO R4 WiFi + 4x DS18B20 sensors (digital 1-Wire).
+ *
+ * Purpose: measure the heat-recovery efficiency of a balanced (double-flow) HRV / VMC.
+ * With all four air streams measured, the efficiency is computed for real
+ * (no estimated indoor temperature needed).
+ *
+ *   The 4 air streams of a double-flow VMC, one DS18B20 per digital pin:
+ *     D1 -> OUTDOOR intake   (fresh air entering from outside)          [cold in winter]
+ *     D3 -> SUPPLY to rooms  (blown into the rooms, after the exchanger) [warmed]
+ *     D5 -> EXTRACT / indoor (stale air pulled from the rooms)           [warm]
+ *     D7 -> EXHAUST outside  (rejected outside, after the exchanger)     [cooled]
+ *
+ * Two efficiencies are reported:
+ *
+ *   Supply side (the usual "thermal efficiency"):
+ *       eta_supply  = (T_supply  - T_outdoor) / (T_extract - T_outdoor) x 100 %
+ *
+ *   Extract side:
+ *       eta_extract = (T_extract - T_exhaust) / (T_extract - T_outdoor) x 100 %
+ *
+ * Sensors: DS18B20, stainless-steel waterproof probe, adapter module with built-in
+ *   pull-up. Programmable-resolution 1-Wire thermometer, -55..+125 C, +/-0.5 C.
+ *
+ * Networking: built-in WiFi of the UNO R4 WiFi (ESP32-S3), DHCP.
+ *   HTTP server (aWOT library):
+ *       GET /temp  -> JSON with the four temperatures and both efficiencies
+ *
+ * Libraries to install (Arduino IDE Library Manager):
+ *   - OneWire            (Paul Stoffregen)
+ *   - DallasTemperature  (Miles Burton)
+ *   - aWOT               (Lasse Lukkari)   -> HTTP server + routing
+ *   - WiFiS3             (bundled with the "Arduino UNO R4 Boards" package)
+ *
+ * Wiring: one probe per bus (one pin = one probe). The R4 runs at 5V.
+ *   Each sensor: VCC->+5V, GND->GND, DATA-> its pin (1, 3, 5 or 7).
+ *
+ * NOTE on pin D1: it is also the Serial1 TX pin. This is fine here because the
+ * USB Serial Monitor uses the native USB port, not Serial1 -- just don't use
+ * Serial1 in this sketch. If you prefer, move that probe to another free digital pin.
+ *
+ * NOTE: the DS18B20 is a DIGITAL sensor; it is not read with analogRead().
+ * The pull-up resistor (~4.7k) is already present on each module.
+ */
+
+#include <WiFiS3.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <aWOT.h>
+#include "WDT.h"                 // hardware watchdog (Arduino UNO R4 core)
+#include "Arduino_LED_Matrix.h" // built-in 12x8 LED matrix (Arduino UNO R4 core)
+#include "arduino_secrets.h"    // private WiFi credentials (SECRET_SSID / SECRET_PASS)
+
+// -------------------- Configuration --------------------
+
+// Enable (true) or disable (false) the network stack.
+//   true  -> WiFi + HTTP server (normal operation)
+//   false -> no network; temperatures and efficiencies are printed to the Serial Monitor.
+const bool ENABLE_NETWORK = true;
+
+// WiFi credentials, kept out of this file: see arduino_secrets.h.
+const char WIFI_SSID[]     = SECRET_SSID;
+const char WIFI_PASSWORD[] = SECRET_PASS;
+
+// Network hostname advertised to the router (DHCP) instead of the default
+// "esp32s3-XXXXXX". Use only letters, digits and hyphens.
+const char WIFI_HOSTNAME[] = "vmcbox";
+
+// How long to wait between WiFi reconnection attempts, in milliseconds.
+const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
+
+// Hardware watchdog timeout: the board resets itself if loop() stalls this long.
+// Keep it within the R4 WDT maximum (~5.5 s).
+const uint32_t WDT_TIMEOUT_MS = 5000;
+
+// DS18B20 resolution in bits (9..12). Lower = coarser but much faster conversion:
+//   12 bits -> 0.0625 C, ~750 ms   |   11 bits -> 0.125 C, ~375 ms
+//   10 bits -> 0.25 C,   ~188 ms   |    9 bits -> 0.5 C,    ~94 ms
+// 11 bits is plenty to measure an HRV/VMC and halves the conversion time.
+const uint8_t SENSOR_RESOLUTION_BITS = 11;
+
+// How often the sensors are sampled in the background, in milliseconds.
+const unsigned long SAMPLE_INTERVAL_MS = 2000;
+
+// Time allowed for a conversion to complete before reading the result.
+// Must be >= the conversion time of the chosen resolution (400 ms covers 11 bits).
+const unsigned long CONVERSION_DELAY_MS = 400;
+
+// Bypass (summer free-cooling) detection.
+// When the heat exchanger is bypassed, the supply air ~ outdoor air, so the
+// supply efficiency collapses. Below this threshold (%) we consider the bypass open.
+const float BYPASS_EFFICIENCY_THRESHOLD = 30.0;
+
+// Minimum supply/indoor spread (C) before we call the effect "heating" or
+// "cooling", so the status does not flap when supply ~ indoor.
+const float HOUSE_EFFECT_DEADBAND_C = 0.5;
+
+// --- The four air streams ---------------------------------------------------
+// Indices into the sensor arrays. Order matters: it maps each stream to a pin
+// and to a JSON field below. Adjust SENSOR_PINS if your wiring differs.
+enum AirStream { OUTDOOR = 0, SUPPLY = 1, EXTRACT = 2, EXHAUST = 3, STREAM_COUNT = 4 };
+
+// Digital pin carrying each stream's probe (index-aligned with enum AirStream).
+const uint8_t SENSOR_PINS[STREAM_COUNT] = { 1, 3, 5, 7 };
+
+// JSON field name for each stream (index-aligned with enum AirStream).
+const char *SENSOR_JSON[STREAM_COUNT] = {
+  "outdoor_intake_C",
+  "supply_to_rooms_C",
+  "indoor_extract_C",
+  "exhaust_outside_C"
+};
+
+// Human-readable label for each stream (Serial output).
+const char *SENSOR_LABEL[STREAM_COUNT] = {
+  "Outdoor intake (D1)",
+  "Supply to rooms (D3)",
+  "Indoor extract (D5)",
+  "Exhaust outside (D7)"
+};
+
+// WiFi server (port 80) + aWOT HTTP application.
+WiFiServer server(80);
+Application app;
+
+// Built-in 12x8 LED matrix, used as a supply-efficiency gauge.
+ArduinoLEDMatrix matrix;
+
+// --- Runtime state ---
+unsigned long lastWifiAttempt = 0; // millis() of the last WiFi.begin() attempt
+bool wifiWasConnected = false;     // for logging connect/disconnect transitions
+bool wdtStarted = false;           // true once the watchdog is running
+
+// One independent 1-Wire bus per probe.
+OneWire oneWire[STREAM_COUNT] = {
+  OneWire(SENSOR_PINS[OUTDOOR]),
+  OneWire(SENSOR_PINS[SUPPLY]),
+  OneWire(SENSOR_PINS[EXTRACT]),
+  OneWire(SENSOR_PINS[EXHAUST])
+};
+DallasTemperature sensors[STREAM_COUNT] = {
+  DallasTemperature(&oneWire[OUTDOOR]),
+  DallasTemperature(&oneWire[SUPPLY]),
+  DallasTemperature(&oneWire[EXTRACT]),
+  DallasTemperature(&oneWire[EXHAUST])
+};
+
+// Value returned by the library on a read error.
+const float TEMP_ERROR = DEVICE_DISCONNECTED_C; // -127.0
+
+// -------------------- Temperature reading (non-blocking) --------------------
+//
+// The DS18B20 needs a few hundred ms to convert. Instead of blocking on every
+// HTTP request, we run the conversion in the background and serve cached values:
+//   1. periodically fire a conversion on every bus (returns immediately),
+//   2. once CONVERSION_DELAY_MS has elapsed, latch the results into the cache.
+// updateSensors() must be called often from loop(); it never blocks.
+
+// Latest readings per stream, served by the HTTP handler and the serial output.
+float cached[STREAM_COUNT] = { TEMP_ERROR, TEMP_ERROR, TEMP_ERROR, TEMP_ERROR };
+
+// Background conversion state.
+unsigned long lastSampleTime = 0;
+bool conversionPending = false;
+
+// Advances the background sampling state machine.
+// Returns true only on the tick where a fresh reading was just latched.
+bool updateSensors() {
+  unsigned long now = millis();
+
+  if (!conversionPending) {
+    // Idle: start a new conversion once the sampling interval has elapsed.
+    if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+      for (int i = 0; i < STREAM_COUNT; i++) {
+        sensors[i].requestTemperatures(); // non-blocking (setWaitForConversion(false))
+      }
+      lastSampleTime = now;
+      conversionPending = true;
+    }
+    return false;
+  }
+
+  // Conversion running: wait for it to finish, then read every bus.
+  if (now - lastSampleTime >= CONVERSION_DELAY_MS) {
+    for (int i = 0; i < STREAM_COUNT; i++) {
+      cached[i] = sensors[i].getTempCByIndex(0);
+    }
+    conversionPending = false;
+    return true;
+  }
+
+  return false;
+}
+
+// -------------------- Efficiency --------------------
+
+// Generic recovery-efficiency ratio, in percent:
+//   (numHi - numLo) / (denHi - denLo) x 100
+// Returns NAN if any input is invalid or the denominator is too small
+// (near-zero temperature spread makes the ratio meaningless, e.g. mild weather).
+float efficiencyRatio(float numHi, float numLo, float denHi, float denLo) {
+  if (numHi == TEMP_ERROR || numLo == TEMP_ERROR ||
+      denHi == TEMP_ERROR || denLo == TEMP_ERROR) {
+    return NAN;
+  }
+  float denom = denHi - denLo;
+  if (fabs(denom) < 1.0) { // less than 1 C spread: not meaningful
+    return NAN;
+  }
+  return (numHi - numLo) / denom * 100.0;
+}
+
+// Supply-side thermal efficiency: how much of the available heat the supply air recovered.
+float supplyEfficiency() {
+  return efficiencyRatio(cached[SUPPLY], cached[OUTDOOR], cached[EXTRACT], cached[OUTDOOR]);
+}
+
+// Extract-side efficiency: how much heat the extract air gave up before being exhausted.
+float extractEfficiency() {
+  return efficiencyRatio(cached[EXTRACT], cached[EXHAUST], cached[EXTRACT], cached[OUTDOOR]);
+}
+
+// -------------------- Bypass / free-cooling status --------------------
+
+// True when the supply air bypasses the exchanger (supply efficiency collapsed):
+// the incoming fresh air is no longer tempered, which is the summer free-cooling mode.
+// Returns false when the efficiency is undecidable (temperatures too close).
+bool isBypassOpen() {
+  float eff = supplyEfficiency();
+  if (isnan(eff)) {
+    return false; // undecidable -> treat as not open
+  }
+  return eff < BYPASS_EFFICIENCY_THRESHOLD;
+}
+
+// Net thermal effect of the ventilation on the house, from the supply air (D3)
+// compared to the indoor air (D5). Independent of the bypass state.
+//   "heating" -> supply warmer than indoor
+//   "cooling" -> supply cooler than indoor
+//   "neutral" -> within the deadband
+//   "unknown" -> a reading is invalid
+const char *houseEffect() {
+  float supply = cached[SUPPLY];
+  float indoor = cached[EXTRACT];
+  if (supply == TEMP_ERROR || indoor == TEMP_ERROR) {
+    return "unknown";
+  }
+  float delta = supply - indoor;
+  if (delta > HOUSE_EFFECT_DEADBAND_C) {
+    return "heating";
+  }
+  if (delta < -HOUSE_EFFECT_DEADBAND_C) {
+    return "cooling";
+  }
+  return "neutral";
+}
+
+// -------------------- LED matrix gauge --------------------
+
+// Draws the supply efficiency (0..100 %) as a horizontal bar on the 12x8 matrix:
+// the bar fills from the left, one full column per ~8.3 %.
+// When the efficiency is not computable (null), a dotted line is shown instead.
+void updateMatrix() {
+  uint8_t frame[8][12] = {{0}};
+  float eff = supplyEfficiency();
+
+  if (isnan(eff)) {
+    // "No data" pattern: a dotted horizontal line across the middle.
+    for (int col = 0; col < 12; col += 2) {
+      frame[3][col] = 1;
+      frame[4][col] = 1;
+    }
+  } else {
+    // Clamp to 0..100 (values can fall outside in non-physical cases) and
+    // convert to a number of fully-lit columns.
+    if (eff < 0.0)   eff = 0.0;
+    if (eff > 100.0) eff = 100.0;
+    int cols = (int)round(eff / 100.0 * 12.0);
+    for (int col = 0; col < cols; col++) {
+      for (int row = 0; row < 8; row++) {
+        frame[row][col] = 1;
+      }
+    }
+  }
+
+  matrix.renderBitmap(frame, 8, 12);
+}
+
+// -------------------- Route handlers (aWOT) --------------------
+
+// Writes a JSON number, or null if the value is invalid.
+void printJsonNumber(Response &res, float value, int decimals) {
+  if (isnan(value) || value == TEMP_ERROR) {
+    res.print("null");
+  } else {
+    res.print(value, decimals);
+  }
+}
+
+// GET /temp -> JSON (served from the cache, never blocks)
+void handleTemp(Request &req, Response &res) {
+  res.set("Content-Type", "application/json");
+  res.set("Access-Control-Allow-Origin", "*");
+
+  res.print("{");
+  for (int i = 0; i < STREAM_COUNT; i++) {
+    res.print("\"");
+    res.print(SENSOR_JSON[i]);
+    res.print("\":");
+    printJsonNumber(res, cached[i], 2);
+    res.print(",");
+  }
+  res.print("\"supply_efficiency_percent\":");
+  printJsonNumber(res, supplyEfficiency(), 1);
+  res.print(",\"extract_efficiency_percent\":");
+  printJsonNumber(res, extractEfficiency(), 1);
+
+  // Bypass (summer free-cooling) status.
+  res.print(",\"bypass_open\":");
+  res.print(isBypassOpen() ? "true" : "false");
+
+  // Net effect on the house: heating / cooling / neutral.
+  res.print(",\"house_effect\":\"");
+  res.print(houseEffect());
+  res.print("\"");
+
+  res.print("}");
+}
+
+// -------------------- Watchdog --------------------
+
+// Refreshes the hardware watchdog (no-op until it has been started).
+inline void feedWatchdog() {
+  if (wdtStarted) {
+    WDT.refresh();
+  }
+}
+
+// -------------------- WiFi (non-blocking keeper) --------------------
+
+// Keeps the WiFi link up without freezing the loop: logs connect/disconnect
+// transitions and retries a dropped connection every WIFI_RETRY_INTERVAL_MS.
+// The WiFiS3 WiFi.begin() call itself can block for a few seconds while it
+// associates; the watchdog is fed right before it to avoid a spurious reset.
+void maintainWiFi() {
+  // "Up" means associated AND a DHCP lease obtained. WiFiS3 reports WL_CONNECTED
+  // a moment before the DHCP address is assigned, so localIP() can briefly be
+  // 0.0.0.0 -- we must wait for a real address before declaring the link ready.
+  bool up = (WiFi.status() == WL_CONNECTED) &&
+            (WiFi.localIP() != IPAddress(0, 0, 0, 0));
+
+  if (up) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      Serial.print(F("WiFi connected. IP address: "));
+      Serial.println(WiFi.localIP());
+    }
+    return;
+  }
+
+  // Not fully up: disconnected, or associated but still waiting for DHCP.
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    Serial.println(F("WiFi connection lost."));
+  }
+
+  // Retry periodically. This also recovers from a stuck DHCP (associated but 0.0.0.0).
+  if (millis() - lastWifiAttempt >= WIFI_RETRY_INTERVAL_MS) {
+    Serial.print(F("Connecting to WiFi: "));
+    Serial.println(WIFI_SSID);
+    feedWatchdog();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    lastWifiAttempt = millis();
+  }
+}
+
+// -------------------- Setup --------------------
+
+void setup() {
+  Serial.begin(9600);
+  // Wait briefly for a PC to open the Serial Monitor, but never block forever:
+  // the board must be able to run headless (wall adapter, no computer attached).
+  unsigned long serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < 3000) {
+    ; // up to 3 s
+  }
+
+  // Start the built-in LED matrix (efficiency gauge).
+  matrix.begin();
+
+  // Initialise the four DS18B20 sensors.
+  for (int i = 0; i < STREAM_COUNT; i++) {
+    sensors[i].begin();
+    sensors[i].setResolution(SENSOR_RESOLUTION_BITS);
+    sensors[i].setWaitForConversion(false); // requestTemperatures() returns immediately
+
+    Serial.print(F("Sensor on pin D"));
+    Serial.print(SENSOR_PINS[i]);
+    Serial.print(F(" ("));
+    Serial.print(SENSOR_LABEL[i]);
+    Serial.print(F(") detected: "));
+    Serial.println(sensors[i].getDeviceCount());
+  }
+
+  // Network stack, unless disabled.
+  if (!ENABLE_NETWORK) {
+    Serial.println(F("Network disabled (ENABLE_NETWORK = false)."));
+    Serial.println(F("Printing temperatures and efficiencies to the Serial Monitor."));
+  } else if (WiFi.status() == WL_NO_MODULE) {
+    Serial.println(F("WiFi module not found. Halting."));
+    while (true) {
+      delay(1000);
+    }
+  } else {
+    // Advertise a friendly hostname to the router (must be set before begin()).
+    WiFi.setHostname(WIFI_HOSTNAME);
+
+    // First connection attempt. The watchdog is not running yet, so a slow
+    // WiFi associate here cannot trigger a reset.
+    lastWifiAttempt = millis() - WIFI_RETRY_INTERVAL_MS; // allow an immediate attempt
+    maintainWiFi();
+
+    app.get("/temp", &handleTemp);
+    server.begin();
+    Serial.println(F("HTTP server ready. Try: GET /temp"));
+  }
+
+  // Start the hardware watchdog last, once any long WiFi associate is over.
+  if (WDT.begin(WDT_TIMEOUT_MS)) {
+    wdtStarted = true;
+    Serial.print(F("Watchdog enabled: "));
+    Serial.print(WDT_TIMEOUT_MS);
+    Serial.println(F(" ms"));
+  } else {
+    Serial.println(F("Watchdog init failed (timeout out of range); continuing without it."));
+  }
+}
+
+// -------------------- Main loop --------------------
+
+// Prints one efficiency line to the Serial Monitor.
+void printEfficiencySerial(const char *label, float value) {
+  Serial.print(label);
+  Serial.print(F(": "));
+  if (isnan(value)) {
+    Serial.println(F("n/a"));
+  } else {
+    Serial.print(value, 1);
+    Serial.println(F(" %"));
+  }
+}
+
+void loop() {
+  feedWatchdog();
+
+  // Advance the background sampling; true when a fresh reading was just latched.
+  bool freshReading = updateSensors();
+
+  // Refresh the LED gauge whenever a new reading is available.
+  if (freshReading) {
+    updateMatrix();
+  }
+
+  // ----- No-network mode: Serial output -----
+  if (!ENABLE_NETWORK) {
+    if (freshReading) {
+      for (int i = 0; i < STREAM_COUNT; i++) {
+        Serial.print(SENSOR_LABEL[i]);
+        Serial.print(F(": "));
+        if (cached[i] == TEMP_ERROR) {
+          Serial.println(F("sensor not detected"));
+        } else {
+          Serial.print(cached[i], 2);
+          Serial.println(F(" C"));
+        }
+      }
+      printEfficiencySerial("Supply efficiency", supplyEfficiency());
+      printEfficiencySerial("Extract efficiency", extractEfficiency());
+      Serial.print(F("Bypass open: "));
+      Serial.println(isBypassOpen() ? F("yes") : F("no"));
+      Serial.print(F("House effect: "));
+      Serial.println(houseEffect());
+      Serial.println();
+    }
+    return;
+  }
+
+  // ----- Network mode: HTTP server -----
+
+  // Keep WiFi up (non-blocking); reconnects in the background if the link drops.
+  maintainWiFi();
+
+  // aWOT parses the incoming request and calls the matching handler.
+  WiFiClient client = server.available();
+  if (client.connected()) {
+    app.process(&client);
+    client.stop();
+  }
+}
