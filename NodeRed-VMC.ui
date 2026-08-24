@@ -1,0 +1,90 @@
+<template>
+    <div class="vmc-synoptique">
+        <svg viewBox="0 0 340 185" class="vmc-svg">
+            <defs>
+                <marker id="vmcFlecheFroid" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto">
+                    <path d="M 0 0 L 10 5 L 0 10 z" class="tete-froid" />
+                </marker>
+                <marker id="vmcFlecheChaud" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto">
+                    <path d="M 0 0 L 10 5 L 0 10 z" class="tete-chaud" />
+                </marker>
+            </defs>
+
+            <rect x="105" y="32" width="130" height="145" rx="10" class="caisson" />
+
+            <path d="M 170 60 L 212 105 L 170 150 L 128 105 Z" class="echangeur" />
+            <line x1="141" y1="105" x2="199" y2="105" class="plaque" />
+
+            <path d="M 330 155 L 220 155 L 189 130 L 151 130 L 120 155 L 14 155"
+                  class="flux flux-chaud" marker-end="url(#vmcFlecheChaud)" />
+
+            <path d="M 10 55 L 120 55" class="flux flux-froid" />
+            <path d="M 120 55 L 151 80 L 189 80 L 220 55"
+                  class="flux flux-froid"
+                  :class="msg?.payload?.bypass_open ? 'inactif' : 'actif'" />
+            <path d="M 120 55 L 220 55"
+                  class="flux flux-froid"
+                  :class="msg?.payload?.bypass_open ? 'actif' : 'inactif'" />
+            <path d="M 220 55 L 326 55" class="flux flux-froid" marker-end="url(#vmcFlecheFroid)" />
+
+            <line x1="120" y1="55" x2="142" y2="55" class="clapet"
+                  :transform="'rotate(' + (msg?.payload?.bypass_open ? 45 : -45) + ' 120 55)'" />
+            <circle cx="120" cy="55" r="3" class="charniere" />
+
+            <text x="12" y="42" class="etiquette">Air neuf
+                <tspan class="valeur">{{ msg?.payload?.outdoor_intake_C != null ? msg.payload.outdoor_intake_C.toFixed(1) + ' °C' : '—' }}</tspan>
+            </text>
+            <text x="328" y="42" text-anchor="end" class="etiquette">Soufflage
+                <tspan class="valeur">{{ msg?.payload?.supply_to_rooms_C != null ? msg.payload.supply_to_rooms_C.toFixed(1) + ' °C' : '—' }}</tspan>
+            </text>
+            <text x="12" y="176" class="etiquette">Rejet
+                <tspan class="valeur">{{ msg?.payload?.exhaust_outside_C != null ? msg.payload.exhaust_outside_C.toFixed(1) + ' °C' : '—' }}</tspan>
+            </text>
+            <text x="328" y="176" text-anchor="end" class="etiquette">Extraction
+                <tspan class="valeur">{{ msg?.payload?.indoor_extract_C != null ? msg.payload.indoor_extract_C.toFixed(1) + ' °C' : '—' }}</tspan>
+            </text>
+
+        </svg>
+
+        <div class="vmc-legende">
+            <span class="chip" :class="msg?.payload?.bypass_open ? 'chip-ouvert' : 'chip-ferme'">
+                Bypass {{ msg?.payload?.bypass_open === undefined ? '?' : (msg.payload.bypass_open ? 'ouvert' : 'fermé') }}
+            </span>
+            <span class="chip" :class="'chip-' + (msg?.payload?.house_effect || 'inconnu')">
+                {{ msg?.payload?.house_effect === 'cooling' ? 'Rafraîchissement' : msg?.payload?.house_effect === 'heating' ? 'Récupération' : msg?.payload?.house_effect ? 'Neutre' : '—' }}
+            </span>
+        </div>
+    </div>
+</template>
+
+<style>
+.vmc-synoptique { display: flex; flex-direction: column; gap: 8px; height: 100%; min-height: 0; overflow: hidden; }
+.vmc-svg { flex: 1 1 auto; width: 100%; min-height: 0; display: block; }
+
+.caisson { fill: none; stroke: currentColor; stroke-opacity: 0.25; stroke-dasharray: 4 4; }
+.echangeur { fill: currentColor; fill-opacity: 0.10; stroke: currentColor; stroke-opacity: 0.4; }
+.plaque { stroke: currentColor; stroke-opacity: 0.35; stroke-dasharray: 3 3; }
+
+.flux { fill: none; stroke-width: 3.5; stroke-linecap: round; stroke-linejoin: round; transition: opacity 0.4s ease; }
+.flux-froid { stroke: #0288d1; }
+.flux-chaud { stroke: #e64a19; }
+.tete-froid { fill: #0288d1; }
+.tete-chaud { fill: #e64a19; }
+.actif { opacity: 1; }
+.inactif { opacity: 0.18; stroke-dasharray: 6 6; }
+
+.clapet { stroke: #455a64; stroke-width: 4; stroke-linecap: round; transition: transform 0.5s ease; }
+.charniere { fill: #455a64; }
+
+.etiquette { font-size: 11px; fill: currentColor; fill-opacity: 0.65; }
+.valeur { font-size: 12px; font-weight: 700; fill-opacity: 1; }
+
+.vmc-legende { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+.chip { padding: 2px 12px; border-radius: 12px; font-size: 0.8rem; font-weight: 600; color: #fff; white-space: nowrap; }
+.chip-ouvert { background: #388e3c; }
+.chip-ferme { background: #78909c; }
+.chip-cooling { background: #0288d1; }
+.chip-heating { background: #e64a19; }
+.chip-neutral { background: #78909c; }
+.chip-inconnu { background: #b0bec5; }
+</style>
